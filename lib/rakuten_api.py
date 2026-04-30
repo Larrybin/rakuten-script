@@ -175,9 +175,12 @@ def build_token_key(client_id: str, client_secret: str) -> str:
 
 def _parse_advertiser_search_xml(xml_text: str) -> list:
     """解析 Advertiser Search API v1 的 XML 响应。
-    响应格式: <ns1:getMerchantByNameResponse>
-        <ns1:return><ns1:mid>123</ns1:mid><ns1:merchantname>Xxx</ns1:merchantname></ns1:return>
-    </ns1:getMerchantByNameResponse>
+    实际响应格式:
+      <result>
+        <midlist>
+          <merchant><mid>123</mid><merchantname>Xxx</merchantname></merchant>
+        </midlist>
+      </result>
     返回: [{"mid": 123, "merchantname": "Xxx"}, ...]
     """
     text = (xml_text or "").strip()
@@ -190,18 +193,19 @@ def _parse_advertiser_search_xml(xml_text: str) -> list:
 
     merchants = []
     for item in root.iter():
-        if _xml_tag_name(item.tag) != "return":
+        tag = _xml_tag_name(item.tag)
+        if tag != "merchant":
             continue
         merchant = {}
         for child in list(item):
-            tag = _xml_tag_name(child.tag)
+            child_tag = _xml_tag_name(child.tag)
             value = (child.text or "").strip()
-            if tag == "mid" and value:
+            if child_tag == "mid" and value:
                 try:
                     merchant["mid"] = int(value)
                 except ValueError:
                     merchant["mid"] = value
-            elif tag == "merchantname" and value:
+            elif child_tag == "merchantname" and value:
                 merchant["merchantname"] = value
         if merchant.get("mid"):
             merchants.append(merchant)
