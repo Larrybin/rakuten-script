@@ -1060,12 +1060,30 @@ def process_brand_application(driver, brand_info: Dict[str, Any], service=None, 
                 body_text = (driver.find_element(By.TAG_NAME, "body").text or "").lower()
             except Exception:
                 pass
-            already_applied = any(kw in body_text for kw in ["pending", "applied", "approved", "active", "partnered"])
+
+            # 检测是否不符合申请条件（广告主设置了限制条件）
+            cannot_partner = any(kw in body_text for kw in [
+                "cannot partner with this advertiser",
+                "you do not meet these terms",
+                "cannot partner",
+            ])
+            if cannot_partner:
+                print("INFO: 该广告主不允许申请 (不满足广告主的合作条件)")
+                update_branlist_row(row_idx, header_map, current_url, APPLY_STATUS_SKIPPED, "不满足广告主合作条件", service)
+                brand_info["brand_url"] = current_url
+                return False
+
+            # 检测是否真正的已合作/已申请状态（排除 'not partnered'）
+            # 先移除 'not partnered' 再做关键词检测
+            cleaned_text = body_text.replace("not partnered", "")
+            already_applied = any(kw in cleaned_text for kw in [
+                "pending approval", "pending", "applied", "approved", "partnered",
+            ])
             if already_applied:
                 print("INFO: 页面显示已申请/已合作状态")
                 update_branlist_row(row_idx, header_map, current_url, APPLY_STATUS_APPLIED, "页面已存在合作或申请状态", service)
             else:
-                print("INFO: 没有找到 Apply 按钮 (可能不支持申请或已申请过)")
+                print("INFO: 没有找到 Apply 按钮 (可能不支持申请)")
                 update_branlist_row(row_idx, header_map, current_url, APPLY_STATUS_SKIPPED, "没有Apply按钮", service)
             brand_info["brand_url"] = current_url
             return already_applied
