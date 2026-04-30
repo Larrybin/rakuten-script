@@ -81,6 +81,31 @@ class RakutenApiClient:
         data = self.get(f"/v2/advertisers/{advertiser_id}")
         return data.get("advertiser") or {}
 
+    def search_advertisers(self, merchant_name: str) -> list:
+        """通过 Advertiser Search API (v1) 按名称搜索广告主，返回 [{mid, merchantname}]"""
+        try:
+            data = self.get("/advertisersearch/1.0", params={"merchantname": merchant_name})
+        except Exception:
+            return []
+        # 响应格式: {"midlist": {"merchant": [{"mid": 123, "merchantname": "xxx"}, ...]}}
+        midlist = data.get("midlist") or {}
+        merchants = midlist.get("merchant") or []
+        if isinstance(merchants, dict):
+            merchants = [merchants]
+        return merchants
+
+    def get_offers(self, advertiser_id: int, offer_status: str = "active", limit: int = 10) -> list:
+        """获取指定广告主的 offers 列表"""
+        try:
+            data = self.get("/v1/offers", params={
+                "advertiser": advertiser_id,
+                "offer_status": offer_status,
+                "limit": limit,
+            })
+        except Exception:
+            return []
+        return data.get("offers") or []
+
     def create_deep_link(self, advertiser_id: str, url: str, u1: str = "") -> str:
         payload: Dict[str, Any] = {"url": url, "advertiser_id": int(advertiser_id)}
         if u1:

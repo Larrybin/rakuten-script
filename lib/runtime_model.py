@@ -507,3 +507,21 @@ def resolve_subject_credentials(spreadsheet_id: str, service, subject_id: str) -
     if match.account_status != ACCOUNT_STATUS_ACTIVE:
         raise ConfigError(f"主体不是 active 状态: {match.rakuten_account}")
     return match.rakuten_account, match.rakuten_password, match.env_serial
+
+
+def resolve_subject_api_credentials(spreadsheet_id: str, service, subject_id: str) -> Tuple[str, str, str]:
+    """从 King 中读取 Rakuten API 凭据 (account_id, client_id, client_secret)。
+    如果未配置则返回 ('', '', '')。
+    """
+    rows, errors = parse_king_rows(spreadsheet_id, service)
+    if errors:
+        return "", "", ""
+    matches = [row for row in rows if row.subject_id == normalize_subject_id(subject_id)]
+    if not matches:
+        return "", "", ""
+    match = matches[0]
+    if len(matches) > 1:
+        active_matches = [row for row in matches if row.account_status == ACCOUNT_STATUS_ACTIVE]
+        if active_matches:
+            match = active_matches[0]
+    return match.rakuten_account_id, match.rakuten_client_id, match.rakuten_client_secret

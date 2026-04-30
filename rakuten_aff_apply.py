@@ -29,6 +29,7 @@ from lib.env_manager import open_env_by_serial
 from lib.fingerprint_utils import preload_fingerprint_cache, stop_env
 from lib.google_sheets_helper import get_sheets_service
 from lib.logger import setup_logger, close_logger
+from lib.rakuten_api import RakutenApiClient
 from lib.rakuten_auth import login_rakuten, is_login_page, is_logged_in
 from lib.runtime_model import (
     APPLY_LOG_HEADERS,
@@ -52,6 +53,7 @@ from lib.runtime_model import (
     missing_headers,
     now_iso,
     read_sheet_with_headers,
+    resolve_subject_api_credentials,
     resolve_subject_credentials,
     update_sheet_row,
 )
@@ -885,7 +887,84 @@ def is_pending_approval_page(driver) -> bool:
     return "partnership pending approval" in page_text or "pending approval" in page_text
 
 
-def process_brand_application(driver, brand_info: Dict[str, Any], service=None, header_map=None) -> bool:
+def _try_api_search_and_navigate(driver, brand: str, api_client) -> bool:
+    """尝试通过 Rakuten API 搜索品牌并直接跳转到 offer 详情页。
+    成功返回 True（driver 已在详情页），失败返回 False（需要降级到 UI 搜索）。
+    """
+    if not api_client:
+        return False
+
+    try:
+        # 1. 通过 Advertiser Search API 按名称搜索 MID
+        print(f"INFO: [API] 搜索品牌 '{brand}'...")
+        merchants = api_client.search_advertisers(brand)
+        if not merchants:
+            print(f"INFO: [API] 未找到 '{brand}'，降级到 UI 搜索")
+            return False
+
+        # 找最佳匹配（精确匹配优先）
+        brand_lower = brand.strip().lower()
+        best_mid = None
+        best_name = None
+        for m in merchants:
+            name = (m.get("merchantname") or "").strip()
+            mid = m.get("mid")
+            if not mid:
+                continue
+            if name.lower() == brand_lower:
+                best_mid = int(mid)
+                best_name = name
+                break
+            if best_mid is None:
+                best_mid = int(mid)
+                best_name = name
+
+        if not best_mid:
+            print(f"INFO: [API] 搜索结果无有效 MID，降级到 UI 搜索")
+            return False
+
+        print(f"INFO: [API] 找到 MID={best_mid} ({best_name})")
+
+        # 2. 通过 Offers API 获取该广告主的 active offer
+        offers = api_client.get_offers(best_mid, offer_status="active", limit=5)
+        if not offers:
+            # 尝试 available 状态
+            offers = api_client.get_offers(best_mid, offer_status="available", limit=5)
+        if not offers:
+            print(f"INFO: [API] MID={best_mid} 无可用 offer，降级到 UI 搜索")
+            return False
+
+        # 取第一个 offer 的 ID
+        first_offer = offers[0]
+        offer_advertiser = first_offer.get("advertiser") or {}
+        advertiser_id = offer_advertiser.get("id") or best_mid
+        offer_goid = first_offer.get("goid")
+        if not offer_goid:
+            print(f"INFO: [API] offer 缺少 goid，降级到 UI 搜索")
+            return False
+
+        # 3. 构造详情页 URL 并直接跳转
+        detail_url = f"https://publisher.rakutenadvertising.com/advertisers/{advertiser_id}/offers/{offer_goid}/detail"
+        print(f"INFO: [API] 直接跳转 offer 详情页: {detail_url}")
+        if not safe_navigate(driver, detail_url, timeout=WAIT_FULL_LOAD):
+            print(f"WARN: [API] 详情页加载失败，降级到 UI 搜索")
+            return False
+
+        # 验证是否真正进入了详情页
+        current_url = driver.current_url
+        if "/offers/" in current_url and "/detail" in current_url:
+            print(f"INFO: [API] ✅ 已直接跳转到详情页（跳过 UI 搜索）")
+            return True
+        else:
+            print(f"WARN: [API] 跳转后 URL 不匹配详情页: {current_url[:80]}")
+            return False
+
+    except Exception as e:
+        print(f"WARN: [API] 搜索异常 ({e})，降级到 UI 搜索")
+        return False
+
+
+def process_brand_application(driver, brand_info: Dict[str, Any], service=None, header_map=None, api_client=None) -> bool:
     brand = brand_info["brand"]
     row_idx = brand_info["row_index"]
 
@@ -894,63 +973,72 @@ def process_brand_application(driver, brand_info: Dict[str, Any], service=None, 
     print(f"{'─' * 50}")
 
     try:
-        # 打开搜索页（带重试）
-        print(f"INFO: 导航到搜索页面: {ADVERTISERS_SEARCH_URL}")
-        _ACCORDION_CSS_INJECTED.discard(driver.current_window_handle if hasattr(driver, 'current_window_handle') else None)
-        if not safe_navigate(driver, ADVERTISERS_SEARCH_URL, timeout=WAIT_FULL_LOAD):
-            print("ERROR: 搜索页面加载失败")
-            return False
+        # === 策略1: 尝试 API 搜索 + 直接跳转 ===
+        api_navigated = _try_api_search_and_navigate(driver, brand, api_client)
 
-        # 输入品牌搜索
-        _disable_profile_accordion(driver)
-        print("INFO: 查找搜索框...")
-        search_input = _find_offer_search_input(driver, timeout=15)
-        if not search_input:
-            print("ERROR: 未找到搜索框")
-            return False
-
-        if not _set_input_value(driver, search_input, brand):
-            print("ERROR: 搜索词输入失败")
-            return False
-        time.sleep(1)
-
-        # 点击搜索按钮
-        _disable_profile_accordion(driver)
-        print("INFO: 点击搜索...")
-        if not _trigger_offer_search(driver, search_input):
-            print("ERROR: 无法触发搜索")
-            return False
-
-        # 智能等待搜索结果（最少等 SEARCH_MIN_WAIT 秒保证网络加载）
-        print("INFO: 搜索已触发，等待结果渲染...")
-        cards, no_result = _wait_for_offer_results(driver, brand, timeout=SEARCH_RESULT_TIMEOUT, min_wait=SEARCH_MIN_WAIT)
-
-        # 查找匹配的品牌卡片
-        print("INFO: 匹配结果...")
-        if no_result or not cards:
-            print(f"INFO: 分类 '{brand}' 没有结果")
-            update_branlist_row(row_idx, header_map, "", APPLY_STATUS_SKIPPED, "没有找到该offer", service)
-            return False
-
-        matched_card, current_titles, match_score = _find_best_offer_card(driver, brand)
-        if not matched_card or match_score < 65:
-            print(f"INFO: 没有找到足够匹配 '{brand}' 的结果 (score={match_score}, 结果有: {current_titles[:10]})")
-            update_branlist_row(row_idx, header_map, "", APPLY_STATUS_SKIPPED, "没有找到该offer", service)
-            return False
-
-        print(f"INFO: 找到匹配品牌卡片 (score={match_score})，准备进入 offer 详情...")
-        if not _open_offer_from_card(driver, matched_card):
-            print("WARN: 第一次点击结果未进入详情页，重新获取结果后再试一次...")
-            matched_card, current_titles, match_score = _find_best_offer_card(driver, brand)
-            if not matched_card or not _open_offer_from_card(driver, matched_card):
-                print(f"ERROR: 无法点击进入 '{brand}' 的 offer 详情")
-                update_branlist_row(row_idx, header_map, "", APPLY_STATUS_FAILED, "搜索结果点击失败", service)
+        if api_navigated:
+            # API 成功跳转到详情页，跳过 UI 搜索，直接进入 Apply 流程
+            current_url = driver.current_url
+            print(f"INFO: 进入详情页: {current_url[:80]}")
+        else:
+            # === 策略2: 降级到 UI 搜索 ===
+            # 打开搜索页（带重试）
+            print(f"INFO: 导航到搜索页面: {ADVERTISERS_SEARCH_URL}")
+            _ACCORDION_CSS_INJECTED.discard(driver.current_window_handle if hasattr(driver, 'current_window_handle') else None)
+            if not safe_navigate(driver, ADVERTISERS_SEARCH_URL, timeout=WAIT_FULL_LOAD):
+                print("ERROR: 搜索页面加载失败")
                 return False
 
-        # 等待详情页面
-        _wait_page_full_load(driver, timeout=WAIT_FULL_LOAD)
-        current_url = driver.current_url
-        print(f"INFO: 进入详情页: {current_url[:80]}")
+            # 输入品牌搜索
+            _disable_profile_accordion(driver)
+            print("INFO: 查找搜索框...")
+            search_input = _find_offer_search_input(driver, timeout=15)
+            if not search_input:
+                print("ERROR: 未找到搜索框")
+                return False
+
+            if not _set_input_value(driver, search_input, brand):
+                print("ERROR: 搜索词输入失败")
+                return False
+            time.sleep(1)
+
+            # 点击搜索按钮
+            _disable_profile_accordion(driver)
+            print("INFO: 点击搜索...")
+            if not _trigger_offer_search(driver, search_input):
+                print("ERROR: 无法触发搜索")
+                return False
+
+            # 智能等待搜索结果（最少等 SEARCH_MIN_WAIT 秒保证网络加载）
+            print("INFO: 搜索已触发，等待结果渲染...")
+            cards, no_result = _wait_for_offer_results(driver, brand, timeout=SEARCH_RESULT_TIMEOUT, min_wait=SEARCH_MIN_WAIT)
+
+            # 查找匹配的品牌卡片
+            print("INFO: 匹配结果...")
+            if no_result or not cards:
+                print(f"INFO: 分类 '{brand}' 没有结果")
+                update_branlist_row(row_idx, header_map, "", APPLY_STATUS_SKIPPED, "没有找到该offer", service)
+                return False
+
+            matched_card, current_titles, match_score = _find_best_offer_card(driver, brand)
+            if not matched_card or match_score < 65:
+                print(f"INFO: 没有找到足够匹配 '{brand}' 的结果 (score={match_score}, 结果有: {current_titles[:10]})")
+                update_branlist_row(row_idx, header_map, "", APPLY_STATUS_SKIPPED, "没有找到该offer", service)
+                return False
+
+            print(f"INFO: 找到匹配品牌卡片 (score={match_score})，准备进入 offer 详情...")
+            if not _open_offer_from_card(driver, matched_card):
+                print("WARN: 第一次点击结果未进入详情页，重新获取结果后再试一次...")
+                matched_card, current_titles, match_score = _find_best_offer_card(driver, brand)
+                if not matched_card or not _open_offer_from_card(driver, matched_card):
+                    print(f"ERROR: 无法点击进入 '{brand}' 的 offer 详情")
+                    update_branlist_row(row_idx, header_map, "", APPLY_STATUS_FAILED, "搜索结果点击失败", service)
+                    return False
+
+            # 等待详情页面
+            _wait_page_full_load(driver, timeout=WAIT_FULL_LOAD)
+            current_url = driver.current_url
+            print(f"INFO: 进入详情页: {current_url[:80]}")
 
         # 查找 Apply 按钮
         _disable_profile_accordion(driver)
@@ -1199,6 +1287,20 @@ def process(subject_id: str, env_serial: str, email: str = None, password: str =
             print("ERROR: 登录失败")
             return False
 
+        # 尝试初始化 Rakuten API 客户端（用于 API 搜索加速）
+        api_client = None
+        try:
+            account_id, client_id, client_secret = resolve_subject_api_credentials(
+                get_spreadsheet_id(), service, subject_id
+            )
+            if account_id and client_id and client_secret:
+                api_client = RakutenApiClient.from_credentials(account_id, client_id, client_secret)
+                print("INFO: ✅ Rakuten API 客户端已就绪（启用 API 搜索加速）")
+            else:
+                print("INFO: King 未配置 Rakuten API 凭据，使用 UI 搜索模式")
+        except Exception as e:
+            print(f"WARN: Rakuten API 客户端初始化失败 ({e})，使用 UI 搜索模式")
+
         brands_data, branlist_header_map = read_branlist_data(service, subject_id, env_serial)
         if not brands_data:
             print("ERROR: 当前主体没有 branlist 数据")
@@ -1252,6 +1354,7 @@ def process(subject_id: str, env_serial: str, email: str = None, password: str =
                 brand_info,
                 service=service,
                 header_map=branlist_header_map,
+                api_client=api_client,
             )
             if success:
                 append_apply_log(
