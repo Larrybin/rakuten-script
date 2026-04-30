@@ -1219,34 +1219,38 @@ def process_brand_application(driver, brand_info: Dict[str, Any], service=None, 
 
         # 智能等待弹窗关闭（最少 3 秒，最多 SUBMIT_WAIT_TIMEOUT 秒）
         print("INFO: 等待提交完成...")
-        wait_until(
+        dialog_closed = wait_until(
             driver,
             lambda: not driver.find_elements(By.CSS_SELECTOR, "[role='dialog']:not([aria-hidden='true'])"),
             timeout=SUBMIT_WAIT_TIMEOUT, min_wait=3, description="dialog close",
         )
 
-        # 刷新页面验证
-        print("INFO: 刷新页面验证状态...")
-        driver.refresh()
-        _wait_page_full_load(driver, timeout=WAIT_FULL_LOAD)
-
-        # 检查 Pending (applied)
-        pending_tag = _find_el(
-            driver,
-            By.XPATH,
-            "//div[contains(@class, 'PartnershipPendingTag')]//p[contains(text(), 'Pending')]",
-            timeout=10,
-        )
-        if pending_tag:
-            print("✅ 状态验证通过: Pending (applied)")
+        if dialog_closed:
+            print("✅ 申请弹窗已关闭，提交成功")
             update_branlist_row(row_idx, header_map, current_url, APPLY_STATUS_APPLIED, "Pending (applied)", service)
             brand_info["brand_url"] = current_url
             return True
         else:
-            print("WARN: 状态验证失败，未检测到 Pending 标签")
-            update_branlist_row(row_idx, header_map, current_url, APPLY_STATUS_FAILED, "提交后未见Pending状态", service)
-            brand_info["brand_url"] = current_url
-        return False
+            # 弹窗未关闭，可能提交失败，刷新页面做一次兜底验证
+            print("WARN: 弹窗未在预期时间内关闭，刷新页面验证...")
+            driver.refresh()
+            _wait_page_full_load(driver, timeout=WAIT_FULL_LOAD)
+            pending_tag = _find_el(
+                driver,
+                By.XPATH,
+                "//div[contains(@class, 'PartnershipPendingTag')]//p[contains(text(), 'Pending')]",
+                timeout=10,
+            )
+            if pending_tag:
+                print("✅ 状态验证通过: Pending (applied)")
+                update_branlist_row(row_idx, header_map, current_url, APPLY_STATUS_APPLIED, "Pending (applied)", service)
+                brand_info["brand_url"] = current_url
+                return True
+            else:
+                print("WARN: 状态验证失败，未检测到 Pending 标签")
+                update_branlist_row(row_idx, header_map, current_url, APPLY_STATUS_FAILED, "提交后未见Pending状态", service)
+                brand_info["brand_url"] = current_url
+            return False
 
     except Exception as e:
         print(f"ERROR: 处理品牌 '{brand}' 失败: {e}")
