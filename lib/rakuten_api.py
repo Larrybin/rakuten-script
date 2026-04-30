@@ -82,17 +82,17 @@ class RakutenApiClient:
         return data.get("advertiser") or {}
 
     def search_advertisers(self, merchant_name: str) -> list:
-        """通过 Advertiser Search API (v1) 按名称搜索广告主，返回 [{mid, merchantname}]"""
+        """通过 Advertiser Search API (v1) 按名称搜索广告主，返回 [{mid, merchantname}]。
+        注意: 该 API 返回 XML 格式。
+        """
         try:
-            data = self.get("/advertisersearch/1.0", params={"merchantname": merchant_name})
+            xml_text = self._request_text(
+                "GET", "/advertisersearch/1.0",
+                params={"merchantname": merchant_name},
+            )
         except Exception:
             return []
-        # 响应格式: {"midlist": {"merchant": [{"mid": 123, "merchantname": "xxx"}, ...]}}
-        midlist = data.get("midlist") or {}
-        merchants = midlist.get("merchant") or []
-        if isinstance(merchants, dict):
-            merchants = [merchants]
-        return merchants
+        return _parse_advertiser_search_xml(xml_text)
 
     def get_offers(self, advertiser_id: int, offer_status: str = "active", limit: int = 10) -> list:
         """获取指定广告主的 offers 列表"""
@@ -171,6 +171,41 @@ def build_token_key(client_id: str, client_secret: str) -> str:
         raise ConfigError("King 缺少 RAKUTEN_CLIENT_ID 或 RAKUTEN_CLIENT_SECRET")
     raw = f"{client_id}:{client_secret}".encode("utf-8")
     return base64.b64encode(raw).decode("ascii")
+
+
+def _parse_advertiser_search_xml(xml_text: str) -> list:
+    """解析 Advertiser Search API v1 的 XML 响应。
+    响应格式: <ns1:getMerchantByNameResponse>
+        <ns1:return><ns1:mid>123</ns1:mid><ns1:merchantname>Xxx</ns1:merchantname></ns1:return>
+    </ns1:getMerchantByNameResponse>
+    返回: [{"mid": 123, "merchantname": "Xxx"}, ...]
+    """
+    text = (xml_text or "").strip()
+    if not text:
+        return []
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError:
+        return []
+
+    merchants = []
+    for item in root.iter():
+        if _xml_tag_name(item.tag) != "return":
+            continue
+        merchant = {}
+        for child in list(item):
+            tag = _xml_tag_name(child.tag)
+            value = (child.text or "").strip()
+            if tag == "mid" and value:
+                try:
+                    merchant["mid"] = int(value)
+                except ValueError:
+                    merchant["mid"] = value
+            elif tag == "merchantname" and value:
+                merchant["merchantname"] = value
+        if merchant.get("mid"):
+            merchants.append(merchant)
+    return merchants
 
 
 def parse_link_locator_xml(xml_text: str):
